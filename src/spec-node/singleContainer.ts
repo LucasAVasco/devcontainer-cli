@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 
-import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, logUMask, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError } from './utils';
+import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, getDockerfilePath, getDockerContextPath, DockerResolverParameters, isDockerFileConfig, uriToWSLFsPath, WorkspaceConfiguration, getFolderImageName, inspectDockerImage, logUMask, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError, StopResult } from './utils';
 import { ContainerProperties, setupInContainer, ResolverProgress, ResolverParameters } from '../spec-common/injectHeadless';
 import { ContainerError, toErrorText } from '../spec-common/errors';
 import { ContainerDetails, listContainers, DockerCLIParameters, inspectContainers, dockerCLI, dockerPtyCLI, toPtyExecParameters, ImageDetails, toExecParameters, removeContainer } from '../spec-shutdown/dockerUtils';
@@ -277,6 +277,71 @@ async function buildAndExtendImage(buildParams: DockerResolverParameters, config
 	};
 }
 
+export async function stopDockerfileDevContainer(params: DockerResolverParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerfileConfig | DevContainerFromImageConfig>, idLabels: string[], removeContainer: boolean): Promise<StopResult> {
+	const { common } = params;
+	const { config } = configWithRaw;
+
+	let container: ContainerDetails | undefined;
+
+	let stop = false
+	let remove = false
+	try {
+		container = await findDevContainer(params, idLabels);
+
+		if (container) {
+			stop = await stopExistingContainer(params, idLabels, container);
+		}
+
+	} catch (e) {
+		throw createStopError(e, container, params, config);
+	}
+
+	if (removeContainer) {
+		try {
+			container = await findDevContainer(params, idLabels);
+
+			if (container) {
+				remove = await removeExistingContainer(params, idLabels, container);
+			}
+
+		} catch (e) {
+			throw createStopError(e, container, params, config);
+		}
+	}
+
+	return {
+		stop: stop,
+		remove: remove,
+		params: common,
+		details: container,
+		tunnelInformation: container ? ( common.isLocalContainer ? getTunnelInformation(container) : {} ) : {},
+		dockerContainerId: container?.Id,
+	}
+}
+
+function createStopError(originalError: any, container: ContainerDetails | undefined, params: DockerResolverParameters, config: DevContainerConfig | undefined): ContainerError {
+	let description = 'An error occurred stopping the container.';
+
+	if (originalError?.cmdOutput?.includes('docker: Error response from daemon: authorization denied by plugin')) {
+		description = originalError.cmdOutput;
+	}
+
+	const err = originalError instanceof ContainerError ? originalError : new ContainerError({
+		description,
+		originalError
+	});
+	if (container) {
+		err.manageContainer = true;
+		err.params = params.common;
+		err.containerId = container.Id;
+		err.dockerParams = params;
+	}
+	if (config) {
+		err.config = config;
+	}
+	return err;
+}
+
 export function findUserArg(runArgs: string[] = []) {
 	for (let i = runArgs.length - 1; i >= 0; i--) {
 		const runArg = runArgs[i];
@@ -323,8 +388,44 @@ async function startExistingContainer(params: DockerResolverParameters, labels: 
 	return start;
 }
 
+async function stopExistingContainer(params: DockerResolverParameters, labels: string[], container: ContainerDetails) {
+	const { common } = params;
+	const stop = container.State.Status === 'running';
+	if (stop) {
+		const stopping = 'Stopping container';
+		const stop = common.output.start(stopping);
+		const infoParams = { ...toExecParameters(params), output: makeLog(common.output, LogLevel.Info), print: 'continuous' as 'continuous' };
+		await dockerCLI(infoParams, 'stop', container.Id);
+		common.output.stop(stopping, stop);
+		let exitedContainer = await findExistingContainer(params, labels);
+		if (exitedContainer?.State.Status !== 'exited') {
+			bailOut(common.output, 'Dev container not stopped.');
+		}
+	}
+	return stop;
+}
+
+async function removeExistingContainer(params: DockerResolverParameters, labels: string[], container: ContainerDetails) {
+	const { common } = params;
+	const remove = container.State.Status !== 'running';
+	if (remove) {
+		const starting = 'Removing container';
+		const start = common.output.start(starting);
+		await removeContainer(params, container.Id)
+		common.output.stop(starting, start);
+		let removedContainer = await findDevContainer(params, labels);
+		if (removedContainer) {
+			bailOut(common.output, 'Dev container not removed.');
+		}
+	} else {
+		bailOut(common.output, 'Dev container can not be removed because it is running.');
+	}
+	return remove;
+}
+
 export async function findDevContainer(params: DockerCLIParameters | DockerResolverParameters, labels: string[]): Promise<ContainerDetails | undefined> {
 	const ids = await listContainers(params, true, labels);
+	process.stdout.write(JSON.stringify(ids))
 	const details = await inspectContainers(params, ids);
 	return details.filter(container => container.State.Status !== 'removing')[0];
 }

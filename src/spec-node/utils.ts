@@ -138,6 +138,18 @@ export interface ResolverResult {
 	composeProjectName?: string;
 }
 
+export interface StopResult {
+	stop: boolean,
+	remove: boolean,
+	params: ResolverParameters;
+	details?: ContainerDetails;
+	tunnelInformation: { environmentTunnels?: { remoteAddress: { port: number; host: string }; localAddress: string }[] };
+	isTrusted?: boolean;
+	dockerParams?: DockerResolverParameters;
+	dockerContainerId?: string;
+	composeProjectName?: string;
+}
+
 export interface SubstitutedConfig<T extends DevContainerConfig | ImageMetadataEntry[]> {
 	config: T;
 	raw: T;

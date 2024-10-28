@@ -9,7 +9,7 @@ import textTable from 'text-table';
 
 import * as jsonc from 'jsonc-parser';
 
-import { createDockerParams, createLog, launch, ProvisionOptions } from './devContainers';
+import { createDockerParams, createLog, launch, close, ProvisionOptions, CloseOptions } from './devContainers';
 import { SubstitutedConfig, createContainerProperties, envListToObj, inspectDockerImage, isDockerFileConfig, SubstituteConfig, addSubstitution, findContainerAndIdLabels, getCacheFolder, runAsyncHandler } from './utils';
 import { URI } from 'vscode-uri';
 import { ContainerError } from '../spec-common/errors';
@@ -90,6 +90,8 @@ const mountRegex = /^type=(bind|volume),source=([^,]+),target=([^,]+)(?:,externa
 		y.command('generate-docs', 'Generate documentation', templatesGenerateDocsOptions, templatesGenerateDocsHandler);
 	});
 	y.command(restArgs ? ['exec', '*'] : ['exec <cmd> [args..]'], 'Execute a command on a running dev container', execOptions, execHandler);
+	y.command('stop', 'Stop dev container', stopOptions, stopHandler);
+	y.command('down', 'Stop and delete dev container', downOptions, downHandler);
 	y.epilog(`devcontainer@${version} ${packageFolder}`);
 	y.parse(restArgs ? argv.slice(1) : argv);
 
@@ -680,7 +682,7 @@ async function doBuild({
 			if (envFile) {
 				composeGlobalArgs.push('--env-file', envFile);
 			}
-			
+
 			const composeConfig = await readDockerComposeConfig(buildParams, composeFiles, envFile);
 			const projectName = await getProjectName(params, workspace, composeFiles, composeConfig);
 			const services = Object.keys(composeConfig.services || {});
@@ -1428,4 +1430,317 @@ async function readSecretsFromFile(params: { output?: Log; secretsFile?: string;
 			originalError: e
 		});
 	}
+}
+
+function stopOptions(y: Argv) {
+	return y.options({
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'docker-compose-path': { type: 'string', description: 'Docker Compose CLI path.' },
+		'container-data-folder': { type: 'string', description: 'Container data folder where user data inside the container will be stored.' },
+		'container-system-data-folder': { type: 'string', description: 'Container system data folder where system data inside the container will be stored.' },
+		'workspace-folder': { type: 'string', description: 'Workspace folder path. The devcontainer.json will be looked up relative to this path.' },
+		'workspace-mount-consistency': { choices: ['consistent' as 'consistent', 'cached' as 'cached', 'delegated' as 'delegated'], default: 'cached' as 'cached', description: 'Workspace mount consistency.' },
+		'gpu-availability': { choices: ['all' as 'all', 'detect' as 'detect', 'none' as 'none'], default: 'detect' as 'detect', description: 'Availability of GPUs in case the dev container requires any. `all` expects a GPU to be available.' },
+		'mount-workspace-git-root': { type: 'boolean', default: true, description: 'Mount the workspace using its Git root.' },
+		'id-label': { type: 'string', description: 'Id label(s) of the format name=value. These will be set on the container and used to query for an existing container. If no --id-label is given, one will be inferred from the --workspace-folder path.' },
+		'config': { type: 'string', description: 'devcontainer.json path. The default is to use .devcontainer/devcontainer.json or, if that does not exist, .devcontainer.json in the workspace folder.' },
+		'override-config': { type: 'string', description: 'devcontainer.json path to override any devcontainer.json in the workspace folder (or built-in configuration). This is required when there is no devcontainer.json otherwise.' },
+		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level for the --terminal-log-file. When set to trace, the log level for --log-file will also be set to trace.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'terminal-columns': { type: 'number', implies: ['terminal-rows'], description: 'Number of columns to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'terminal-rows': { type: 'number', implies: ['terminal-columns'], description: 'Number of rows to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'default-user-env-probe': { choices: ['none' as 'none', 'loginInteractiveShell' as 'loginInteractiveShell', 'interactiveShell' as 'interactiveShell', 'loginShell' as 'loginShell'], default: defaultDefaultUserEnvProbe, description: 'Default value for the devcontainer.json\'s "userEnvProbe".' },
+		'update-remote-user-uid-default': { choices: ['never' as 'never', 'on' as 'on', 'off' as 'off'], default: 'on' as 'on', description: 'Default for updating the remote user\'s UID and GID to the local user\'s one.' },
+		'remove-existing-container': { type: 'boolean', default: false, description: 'Removes the dev container if it already exists.' },
+		'build-no-cache': { type: 'boolean', default: false, description: 'Builds the image with `--no-cache` if the container does not exist.' },
+		'expect-existing-container': { type: 'boolean', default: false, description: 'Fail if the container does not exist.' },
+		'skip-post-create': { type: 'boolean', default: false, description: 'Do not run onCreateCommand, updateContentCommand, postCreateCommand, postStartCommand or postAttachCommand and do not install dotfiles.' },
+		'skip-non-blocking-commands': { type: 'boolean', default: false, description: 'Stop running user commands after running the command configured with waitFor or the updateContentCommand by default.' },
+		prebuild: { type: 'boolean', default: false, description: 'Stop after onCreateCommand and updateContentCommand, rerunning updateContentCommand if it has run before.' },
+		'user-data-folder': { type: 'string', description: 'Host path to a directory that is intended to be persisted and share state between sessions.' },
+		'mount': { type: 'string', description: 'Additional mount point(s). Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]' },
+		'remote-env': { type: 'string', description: 'Remote environment variables of the format name=value. These will be added when executing the user commands.' },
+		'cache-from': { type: 'string', description: 'Additional image to use as potential layer cache during image building' },
+		'cache-to': { type: 'string', description: 'Additional image to use as potential layer cache during image building' },
+		'buildkit': { choices: ['auto' as 'auto', 'never' as 'never'], default: 'auto' as 'auto', description: 'Control whether BuildKit should be used' },
+		'additional-features': { type: 'string', description: 'Additional features to apply to the dev container (JSON as per "features" section in devcontainer.json)' },
+		'skip-feature-auto-mapping': { type: 'boolean', default: false, hidden: true, description: 'Temporary option for testing.' },
+		'skip-post-attach': { type: 'boolean', default: false, description: 'Do not run postAttachCommand.' },
+		'dotfiles-repository': { type: 'string', description: 'URL of a dotfiles Git repository (e.g., https://github.com/owner/repository.git)' },
+		'dotfiles-install-command': { type: 'string', description: 'The command to run after cloning the dotfiles repository. Defaults to run the first file of `install.sh`, `install`, `bootstrap.sh`, `bootstrap`, `setup.sh` and `setup` found in the dotfiles repository`s root folder.' },
+		'dotfiles-target-path': { type: 'string', default: '~/dotfiles', description: 'The path to clone the dotfiles repository to. Defaults to `~/dotfiles`.' },
+		'container-session-data-folder': { type: 'string', description: 'Folder to cache CLI data, for example userEnvProbe results' },
+		'omit-config-remote-env-from-metadata': { type: 'boolean', default: false, hidden: true, description: 'Omit remoteEnv from devcontainer.json for container metadata label' },
+		'secrets-file': { type: 'string', description: 'Path to a json file containing secret environment variables as key-value pairs.' },
+		'experimental-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Write lockfile' },
+		'experimental-frozen-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Ensure lockfile remains unchanged' },
+		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
+		'include-configuration': { type: 'boolean', default: false, description: 'Include configuration in result.' },
+		'include-merged-configuration': { type: 'boolean', default: false, description: 'Include merged configuration in result.' },
+	})
+		.check(argv => {
+			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
+			if (idLabels?.some(idLabel => !/.+=.+/.test(idLabel))) {
+				throw new Error('Unmatched argument format: id-label must match <name>=<value>');
+			}
+			if (!(argv['workspace-folder'] || argv['id-label'])) {
+				throw new Error('Missing required argument: workspace-folder or id-label');
+			}
+			if (!(argv['workspace-folder'] || argv['override-config'])) {
+				throw new Error('Missing required argument: workspace-folder or override-config');
+			}
+			const mounts = (argv.mount && (Array.isArray(argv.mount) ? argv.mount : [argv.mount])) as string[] | undefined;
+			if (mounts?.some(mount => !mountRegex.test(mount))) {
+				throw new Error('Unmatched argument format: mount must match type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]');
+			}
+			const remoteEnvs = (argv['remote-env'] && (Array.isArray(argv['remote-env']) ? argv['remote-env'] : [argv['remote-env']])) as string[] | undefined;
+			if (remoteEnvs?.some(remoteEnv => !/.+=.*/.test(remoteEnv))) {
+				throw new Error('Unmatched argument format: remote-env must match <name>=<value>');
+			}
+			return true;
+		});
+}
+
+type StopArgs = UnpackArgv<ReturnType<typeof stopOptions>>;
+
+function stopHandler(args: StopArgs) {
+	runAsyncHandler(stop.bind(null, args, false));
+}
+
+async function stop({
+	'user-data-folder': persistedFolder,
+	'docker-path': dockerPath,
+	'docker-compose-path': dockerComposePath,
+	'container-data-folder': containerDataFolder,
+	'container-system-data-folder': containerSystemDataFolder,
+	'workspace-folder': workspaceFolderArg,
+	'workspace-mount-consistency': workspaceMountConsistency,
+	'gpu-availability': gpuAvailability,
+	'mount-workspace-git-root': mountWorkspaceGitRoot,
+	'id-label': idLabel,
+	config,
+	'override-config': overrideConfig,
+	'log-level': logLevel,
+	'log-format': logFormat,
+	'terminal-rows': terminalRows,
+	'terminal-columns': terminalColumns,
+	'default-user-env-probe': defaultUserEnvProbe,
+	'update-remote-user-uid-default': updateRemoteUserUIDDefault,
+	'remove-existing-container': removeExistingContainer,
+	'build-no-cache': buildNoCache,
+	'expect-existing-container': expectExistingContainer,
+	'skip-post-create': skipPostCreate,
+	'skip-non-blocking-commands': skipNonBlocking,
+	prebuild,
+	mount,
+	'remote-env': addRemoteEnv,
+	'cache-from': addCacheFrom,
+	'cache-to': addCacheTo,
+	'buildkit': buildkit,
+	'additional-features': additionalFeaturesJson,
+	'skip-feature-auto-mapping': skipFeatureAutoMapping,
+	'skip-post-attach': skipPostAttach,
+	'dotfiles-repository': dotfilesRepository,
+	'dotfiles-install-command': dotfilesInstallCommand,
+	'dotfiles-target-path': dotfilesTargetPath,
+	'container-session-data-folder': containerSessionDataFolder,
+	'omit-config-remote-env-from-metadata': omitConfigRemotEnvFromMetadata,
+	'secrets-file': secretsFile,
+	'experimental-lockfile': experimentalLockfile,
+	'experimental-frozen-lockfile': experimentalFrozenLockfile,
+	'omit-syntax-directive': omitSyntaxDirective,
+	'include-configuration': includeConfig,
+	'include-merged-configuration': includeMergedConfig,
+}: StopArgs, removeContainer: boolean) {
+
+	const workspaceFolder = workspaceFolderArg ? path.resolve(process.cwd(), workspaceFolderArg) : undefined;
+	const addRemoteEnvs = addRemoteEnv ? (Array.isArray(addRemoteEnv) ? addRemoteEnv as string[] : [addRemoteEnv]) : [];
+	const addCacheFroms = addCacheFrom ? (Array.isArray(addCacheFrom) ? addCacheFrom as string[] : [addCacheFrom]) : [];
+	const additionalFeatures = additionalFeaturesJson ? jsonc.parse(additionalFeaturesJson) as Record<string, string | boolean | Record<string, string | boolean>> : {};
+	const providedIdLabels = idLabel ? Array.isArray(idLabel) ? idLabel as string[] : [idLabel] : undefined;
+
+	const cwd = workspaceFolder || process.cwd();
+	const cliHost = await getCLIHost(cwd, loadNativeModule, logFormat === 'text');
+	const secretsP = readSecretsFromFile({ secretsFile, cliHost });
+
+	const options: CloseOptions = {
+		dockerPath,
+		dockerComposePath,
+		containerDataFolder,
+		containerSystemDataFolder,
+		workspaceFolder,
+		workspaceMountConsistency,
+		gpuAvailability,
+		mountWorkspaceGitRoot,
+		configFile: config ? URI.file(path.resolve(process.cwd(), config)) : undefined,
+		overrideConfigFile: overrideConfig ? URI.file(path.resolve(process.cwd(), overrideConfig)) : undefined,
+		logLevel: mapLogLevel(logLevel),
+		logFormat,
+		log: text => process.stderr.write(text),
+		terminalDimensions: terminalColumns && terminalRows ? { columns: terminalColumns, rows: terminalRows } : undefined,
+		defaultUserEnvProbe,
+		removeExistingContainer,
+		buildNoCache,
+		expectExistingContainer,
+		postCreateEnabled: !skipPostCreate,
+		skipNonBlocking,
+		prebuild,
+		persistedFolder,
+		additionalMounts: mount ? (Array.isArray(mount) ? mount : [mount]).map(mount => {
+			const [, type, source, target, external] = mountRegex.exec(mount)!;
+			return {
+				type: type as 'bind' | 'volume',
+				source,
+				target,
+				external: external === 'true'
+			};
+		}) : [],
+		dotfiles: {
+			repository: dotfilesRepository,
+			installCommand: dotfilesInstallCommand,
+			targetPath: dotfilesTargetPath,
+		},
+		updateRemoteUserUIDDefault,
+		remoteEnv: envListToObj(addRemoteEnvs),
+		secretsP,
+		additionalCacheFroms: addCacheFroms,
+		useBuildKit: buildkit,
+		buildxPlatform: undefined,
+		buildxPush: false,
+		additionalLabels: [],
+		buildxOutput: undefined,
+		buildxCacheTo: addCacheTo,
+		additionalFeatures,
+		skipFeatureAutoMapping,
+		skipPostAttach,
+		containerSessionDataFolder,
+		skipPersistingCustomizationsFromFeatures: false,
+		omitConfigRemotEnvFromMetadata,
+		experimentalLockfile,
+		experimentalFrozenLockfile,
+		omitSyntaxDirective,
+		includeConfig,
+		includeMergedConfig,
+		down: removeContainer,
+	};
+
+	const result = await doStop(options, providedIdLabels);
+	const exitCode = result.outcome === 'error' ? 1 : 0;
+	await new Promise<void>((resolve, reject) => {
+		process.stdout.write(JSON.stringify(result) + '\n', err => err ? reject(err) : resolve());
+	});
+	if (result.outcome === 'success') {
+		await result.finishBackgroundTasks();
+	}
+	await result.dispose();
+	process.exit(exitCode);
+}
+
+async function doStop(options: CloseOptions, providedIdLabels: string[] | undefined) {
+	const disposables: (() => Promise<unknown> | undefined)[] = [];
+	const dispose = async () => {
+		await Promise.all(disposables.map(d => d()));
+	};
+	try {
+		const result = await close(options, providedIdLabels, disposables);
+		return {
+			outcome: 'success' as 'success',
+			dispose,
+			...result,
+		};
+	} catch (originalError) {
+		const originalStack = originalError?.stack;
+		const err = originalError instanceof ContainerError ? originalError : new ContainerError({
+			description: 'An error occurred closing the container.',
+			originalError
+		});
+		if (originalStack) {
+			console.error(originalStack);
+		}
+		return {
+			outcome: 'error' as 'error',
+			message: err.message,
+			description: err.description,
+			containerId: err.containerId,
+			disallowedFeatureId: err.data.disallowedFeatureId,
+			didStopContainer: err.data.didStopContainer,
+			learnMoreUrl: err.data.learnMoreUrl,
+			dispose,
+		};
+	}
+}
+
+function downOptions(y: Argv) {
+	return y.options({
+		'docker-path': { type: 'string', description: 'Docker CLI path.' },
+		'docker-compose-path': { type: 'string', description: 'Docker Compose CLI path.' },
+		'container-data-folder': { type: 'string', description: 'Container data folder where user data inside the container will be stored.' },
+		'container-system-data-folder': { type: 'string', description: 'Container system data folder where system data inside the container will be stored.' },
+		'workspace-folder': { type: 'string', description: 'Workspace folder path. The devcontainer.json will be looked up relative to this path.' },
+		'workspace-mount-consistency': { choices: ['consistent' as 'consistent', 'cached' as 'cached', 'delegated' as 'delegated'], default: 'cached' as 'cached', description: 'Workspace mount consistency.' },
+		'gpu-availability': { choices: ['all' as 'all', 'detect' as 'detect', 'none' as 'none'], default: 'detect' as 'detect', description: 'Availability of GPUs in case the dev container requires any. `all` expects a GPU to be available.' },
+		'mount-workspace-git-root': { type: 'boolean', default: true, description: 'Mount the workspace using its Git root.' },
+		'id-label': { type: 'string', description: 'Id label(s) of the format name=value. These will be set on the container and used to query for an existing container. If no --id-label is given, one will be inferred from the --workspace-folder path.' },
+		'config': { type: 'string', description: 'devcontainer.json path. The default is to use .devcontainer/devcontainer.json or, if that does not exist, .devcontainer.json in the workspace folder.' },
+		'override-config': { type: 'string', description: 'devcontainer.json path to override any devcontainer.json in the workspace folder (or built-in configuration). This is required when there is no devcontainer.json otherwise.' },
+		'log-level': { choices: ['info' as 'info', 'debug' as 'debug', 'trace' as 'trace'], default: 'info' as 'info', description: 'Log level for the --terminal-log-file. When set to trace, the log level for --log-file will also be set to trace.' },
+		'log-format': { choices: ['text' as 'text', 'json' as 'json'], default: 'text' as 'text', description: 'Log format.' },
+		'terminal-columns': { type: 'number', implies: ['terminal-rows'], description: 'Number of columns to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'terminal-rows': { type: 'number', implies: ['terminal-columns'], description: 'Number of rows to render the output for. This is required for some of the subprocesses to correctly render their output.' },
+		'default-user-env-probe': { choices: ['none' as 'none', 'loginInteractiveShell' as 'loginInteractiveShell', 'interactiveShell' as 'interactiveShell', 'loginShell' as 'loginShell'], default: defaultDefaultUserEnvProbe, description: 'Default value for the devcontainer.json\'s "userEnvProbe".' },
+		'update-remote-user-uid-default': { choices: ['never' as 'never', 'on' as 'on', 'off' as 'off'], default: 'on' as 'on', description: 'Default for updating the remote user\'s UID and GID to the local user\'s one.' },
+		'remove-existing-container': { type: 'boolean', default: false, description: 'Removes the dev container if it already exists.' },
+		'build-no-cache': { type: 'boolean', default: false, description: 'Builds the image with `--no-cache` if the container does not exist.' },
+		'expect-existing-container': { type: 'boolean', default: false, description: 'Fail if the container does not exist.' },
+		'skip-post-create': { type: 'boolean', default: false, description: 'Do not run onCreateCommand, updateContentCommand, postCreateCommand, postStartCommand or postAttachCommand and do not install dotfiles.' },
+		'skip-non-blocking-commands': { type: 'boolean', default: false, description: 'Stop running user commands after running the command configured with waitFor or the updateContentCommand by default.' },
+		prebuild: { type: 'boolean', default: false, description: 'Stop after onCreateCommand and updateContentCommand, rerunning updateContentCommand if it has run before.' },
+		'user-data-folder': { type: 'string', description: 'Host path to a directory that is intended to be persisted and share state between sessions.' },
+		'mount': { type: 'string', description: 'Additional mount point(s). Format: type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]' },
+		'remote-env': { type: 'string', description: 'Remote environment variables of the format name=value. These will be added when executing the user commands.' },
+		'cache-from': { type: 'string', description: 'Additional image to use as potential layer cache during image building' },
+		'cache-to': { type: 'string', description: 'Additional image to use as potential layer cache during image building' },
+		'buildkit': { choices: ['auto' as 'auto', 'never' as 'never'], default: 'auto' as 'auto', description: 'Control whether BuildKit should be used' },
+		'additional-features': { type: 'string', description: 'Additional features to apply to the dev container (JSON as per "features" section in devcontainer.json)' },
+		'skip-feature-auto-mapping': { type: 'boolean', default: false, hidden: true, description: 'Temporary option for testing.' },
+		'skip-post-attach': { type: 'boolean', default: false, description: 'Do not run postAttachCommand.' },
+		'dotfiles-repository': { type: 'string', description: 'URL of a dotfiles Git repository (e.g., https://github.com/owner/repository.git)' },
+		'dotfiles-install-command': { type: 'string', description: 'The command to run after cloning the dotfiles repository. Defaults to run the first file of `install.sh`, `install`, `bootstrap.sh`, `bootstrap`, `setup.sh` and `setup` found in the dotfiles repository`s root folder.' },
+		'dotfiles-target-path': { type: 'string', default: '~/dotfiles', description: 'The path to clone the dotfiles repository to. Defaults to `~/dotfiles`.' },
+		'container-session-data-folder': { type: 'string', description: 'Folder to cache CLI data, for example userEnvProbe results' },
+		'omit-config-remote-env-from-metadata': { type: 'boolean', default: false, hidden: true, description: 'Omit remoteEnv from devcontainer.json for container metadata label' },
+		'secrets-file': { type: 'string', description: 'Path to a json file containing secret environment variables as key-value pairs.' },
+		'experimental-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Write lockfile' },
+		'experimental-frozen-lockfile': { type: 'boolean', default: false, hidden: true, description: 'Ensure lockfile remains unchanged' },
+		'omit-syntax-directive': { type: 'boolean', default: false, hidden: true, description: 'Omit Dockerfile syntax directives' },
+		'include-configuration': { type: 'boolean', default: false, description: 'Include configuration in result.' },
+		'include-merged-configuration': { type: 'boolean', default: false, description: 'Include merged configuration in result.' },
+	})
+		.check(argv => {
+			const idLabels = (argv['id-label'] && (Array.isArray(argv['id-label']) ? argv['id-label'] : [argv['id-label']])) as string[] | undefined;
+			if (idLabels?.some(idLabel => !/.+=.+/.test(idLabel))) {
+				throw new Error('Unmatched argument format: id-label must match <name>=<value>');
+			}
+			if (!(argv['workspace-folder'] || argv['id-label'])) {
+				throw new Error('Missing required argument: workspace-folder or id-label');
+			}
+			if (!(argv['workspace-folder'] || argv['override-config'])) {
+				throw new Error('Missing required argument: workspace-folder or override-config');
+			}
+			const mounts = (argv.mount && (Array.isArray(argv.mount) ? argv.mount : [argv.mount])) as string[] | undefined;
+			if (mounts?.some(mount => !mountRegex.test(mount))) {
+				throw new Error('Unmatched argument format: mount must match type=<bind|volume>,source=<source>,target=<target>[,external=<true|false>]');
+			}
+			const remoteEnvs = (argv['remote-env'] && (Array.isArray(argv['remote-env']) ? argv['remote-env'] : [argv['remote-env']])) as string[] | undefined;
+			if (remoteEnvs?.some(remoteEnv => !/.+=.*/.test(remoteEnv))) {
+				throw new Error('Unmatched argument format: remote-env must match <name>=<value>');
+			}
+			return true;
+		});
+}
+
+type DownArgs = UnpackArgv<ReturnType<typeof downOptions>>;
+
+function downHandler(args: DownArgs) {
+	runAsyncHandler(stop.bind(null, args, true));
 }

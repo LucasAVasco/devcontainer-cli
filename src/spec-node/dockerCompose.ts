@@ -6,7 +6,7 @@
 import * as yaml from 'js-yaml';
 import * as shellQuote from 'shell-quote';
 
-import { createContainerProperties, startEventSeen, ResolverResult, getTunnelInformation, DockerResolverParameters, inspectDockerImage, getEmptyContextFolder, getFolderImageName, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError } from './utils';
+import { createContainerProperties, startEventSeen, ResolverResult, StopResult, getTunnelInformation, DockerResolverParameters, inspectDockerImage, getEmptyContextFolder, getFolderImageName, SubstitutedConfig, checkDockerSupportForGPU, isBuildKitImagePolicyError } from './utils';
 import { ContainerProperties, setupInContainer, ResolverProgress } from '../spec-common/injectHeadless';
 import { ContainerError } from '../spec-common/errors';
 import { Workspace } from '../spec-utils/workspaces';
@@ -111,6 +111,174 @@ async function _openDockerComposeDevContainer(params: DockerResolverParameters, 
 		err.config = config;
 		throw err;
 	}
+}
+
+export async function stopDockerComposeDevContainer(params: DockerResolverParameters, workspace: Workspace, config: SubstitutedConfig<DevContainerFromDockerComposeConfig>, idLabels: string[], additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, removeContainer: boolean): Promise<StopResult> { const { common, dockerCLI, dockerComposeCLI } = params;
+	const { cliHost, env, output } = common;
+	const stopParams: DockerCLIParameters = { cliHost, dockerCLI, dockerComposeCLI, env, output, platformInfo: params.platformInfo };
+	return _stopDockerComposeDevContainer(params, stopParams, workspace, config, idLabels, additionalFeatures, removeContainer);
+}
+
+async function _stopDockerComposeDevContainer(params: DockerResolverParameters, stopParams: DockerCLIParameters, workspace: Workspace, configWithRaw: SubstitutedConfig<DevContainerFromDockerComposeConfig>, idLabels: string[], additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, removeContainer: boolean): Promise<StopResult> {
+	const { common } = params;
+	const { cliHost: stopCLIHost } = stopParams;
+	const { config } = configWithRaw;
+
+	let container: ContainerDetails | undefined;
+	try {
+		const composeFiles = await getDockerComposeFilePaths(stopCLIHost, config, stopCLIHost.env, stopCLIHost.cwd);
+		const cwdEnvFile = stopCLIHost.path.join(stopCLIHost.cwd, '.env');
+		const envFile = Array.isArray(config.dockerComposeFile) && config.dockerComposeFile.length === 0 && await stopCLIHost.isFile(cwdEnvFile) ? cwdEnvFile : undefined;
+		const composeConfig = await readDockerComposeConfig(stopParams, composeFiles, envFile);
+		const projectName = await getProjectName(stopParams, workspace, composeFiles, composeConfig);
+		const containerId = await findComposeContainer(params, projectName, config.service);
+		if (params.expectExistingContainer && !containerId) {
+			throw new ContainerError({ description: 'The expected container does not exist.' });
+		}
+		container = containerId ? await inspectContainer(params, containerId) : undefined;
+
+		const res = await stopContainer(params, stopParams, configWithRaw, projectName, composeFiles, envFile, composeConfig, container, idLabels, additionalFeatures, removeContainer);
+
+		return {
+			stop : res.stop,
+			remove: res.remove,
+			params: common,
+			tunnelInformation: {},
+			dockerParams: params,
+			dockerContainerId: container?.Id,
+			composeProjectName: projectName,
+		};
+
+	} catch (originalError) {
+		const err = originalError instanceof ContainerError ? originalError : new ContainerError({
+			description: 'An error occurred stopping the container.',
+			originalError
+		});
+		if (container) {
+			err.manageContainer = true;
+			err.params = params.common;
+			err.containerId = container.Id;
+			err.dockerParams = params;
+		}
+		err.config = config;
+		throw err;
+	}
+}
+
+async function stopContainer(params: DockerResolverParameters, stopParams: DockerCLIParameters, configWithRaw: SubstitutedConfig<DevContainerFromDockerComposeConfig>, projectName: string, composeFiles: string[], envFile: string | undefined, composeConfig: any, container: ContainerDetails | undefined, idLabels: string[], additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>, removeContainer: boolean) {
+	const { common } = params;
+	const { persistedFolder, output } = common;
+	const { cliHost: buildCLIHost } = stopParams;
+	const { config } = configWithRaw;
+	const featuresBuildOverrideFilePrefix = 'docker-compose.devcontainer.build';
+	const featuresStartOverrideFilePrefix = 'docker-compose.devcontainer.containerFeatures';
+
+	common.progress(ResolverProgress.StartingContainer);
+
+	// If dockerComposeFile is an array, add -f <file> in order. https://docs.docker.com/compose/extends/#multiple-compose-files
+	const composeGlobalArgs = ([] as string[]).concat(...composeFiles.map(composeFile => ['-f', composeFile]));
+	if (envFile) {
+		composeGlobalArgs.push('--env-file', envFile);
+	}
+
+	const infoOutput = makeLog(stopParams.output, LogLevel.Info);
+	const services = Object.keys(composeConfig.services || {});
+	if (services.indexOf(config.service) === -1) {
+		throw new ContainerError({ description: `Service '${config.service}' configured in devcontainer.json not found in Docker Compose configuration.`, data: { fileWithError: composeFiles[0] } });
+	}
+
+	let cancel: () => void;
+	// TODO(LucasAVasco): Implement the following lines to the stop and down commands
+
+	// const canceled = new Promise<void>((_, reject) => cancel = reject);
+	// const { started } = await startEventSeen(params, { [projectLabel]: projectName, [serviceLabel]: config.service }, canceled, common.output, common.getLogLevel() === LogLevel.Trace); // await getEvents, but only assign started.
+
+	const service = composeConfig.services[config.service];
+	const originalImageName = service.image || getDefaultImageName(await stopParams.dockerComposeCLI(), projectName, config.service);
+
+	// Try to restore the 'third' docker-compose file and featuresConfig from persisted storage.
+	// This file may have been generated upon a Codespace creation.
+	const labels = container?.Config?.Labels;
+	output.write(`PersistedPath=${persistedFolder}, ContainerHasLabels=${!!labels}`);
+
+	let didRestoreFromPersistedShare = false;
+	if (container) {
+		if (labels) {
+			// update args for `docker-compose up` to use cached overrides
+			const configFiles = labels['com.docker.compose.project.config_files'];
+			output.write(`Container was created with these config files: ${configFiles}`);
+
+			// Parse out the full name of the 'containerFeatures' configFile
+			const files = configFiles?.split(',') ?? [];
+			const persistedBuildFile = await checkForPersistedFile(buildCLIHost, output, files, featuresBuildOverrideFilePrefix);
+			const persistedStartFile = await checkForPersistedFile(buildCLIHost, output, files, featuresStartOverrideFilePrefix);
+			if ((persistedBuildFile.fileExists || !persistedBuildFile.foundLabel) // require build file if in label
+				&& persistedStartFile.fileExists // always require start file
+			) {
+				didRestoreFromPersistedShare = true;
+				if (persistedBuildFile.fileExists) {
+					composeGlobalArgs.push('-f', persistedBuildFile.file);
+				}
+				if (persistedStartFile.fileExists) {
+					composeGlobalArgs.push('-f', persistedStartFile.file);
+				}
+			}
+		}
+	}
+
+	if (!container || !didRestoreFromPersistedShare) {
+		const noBuild = true; //if we have an existing container, just recreate override files but skip the build
+
+		const versionPrefix = await readVersionPrefix(buildCLIHost, composeFiles);
+		const infoParams = { ...params, common: { ...params.common, output: infoOutput } };
+		const { imageMetadata, additionalComposeOverrideFiles, overrideImageName, labels } = await buildAndExtendDockerCompose(configWithRaw, projectName, infoParams, composeFiles, envFile, composeGlobalArgs, config.runServices ?? [], params.buildNoCache ?? false, persistedFolder, featuresBuildOverrideFilePrefix, versionPrefix, additionalFeatures, true, params.additionalCacheFroms, noBuild);
+		additionalComposeOverrideFiles.forEach(overrideFilePath => composeGlobalArgs.push('-f', overrideFilePath));
+
+		const currentImageName = overrideImageName || originalImageName;
+		let cache: Promise<ImageDetails> | undefined;
+		const imageDetails = () => cache || (cache = inspectDockerImage(params, currentImageName, true));
+		const mergedConfig = mergeConfiguration(config, imageMetadata.config);
+		const updatedImageName = noBuild ? currentImageName : await updateRemoteUserUID(params, mergedConfig, currentImageName, imageDetails, service.user);
+
+		// Save override docker-compose file to disk.
+		// Persisted folder is a path that will be maintained between sessions
+		// Note: As a fallback, persistedFolder is set to the build's tmpDir() directory
+		const additionalLabels = labels ? idLabels.concat(Object.keys(labels).map(key => `${key}=${labels[key]}`)) : idLabels;
+		const overrideFilePath = await writeFeaturesComposeOverrideFile(updatedImageName, currentImageName, mergedConfig, config, versionPrefix, imageDetails, service, additionalLabels, params.additionalMounts, persistedFolder, featuresStartOverrideFilePrefix, buildCLIHost, params, output);
+
+		if (overrideFilePath) {
+			// Add file path to override file as parameter
+			composeGlobalArgs.push('-f', overrideFilePath);
+		}
+	}
+
+	const args = ['--project-name', projectName, ...composeGlobalArgs];
+	args.push(removeContainer ? 'down' : 'stop');
+	if (config.runServices && config.runServices.length) {
+		args.push(...config.runServices);
+		if (config.runServices.indexOf(config.service) === -1) {
+			args.push(config.service);
+		}
+	}
+	try {
+		await dockerComposeCLI({ ...stopParams, output: infoOutput }, ...args);
+	} catch (err) {
+		cancel!();
+
+		let description = 'An error occurred starting Docker Compose ' + (removeContainer ? 'down' : 'stop') + '.';
+		if (err?.cmdOutput?.includes('authorization denied by plugin')) {
+			description = err.cmdOutput;
+		}
+
+		throw new ContainerError({ description, originalError: err, data: { fileWithError: composeFiles[0] } });
+	}
+
+	// await started; // TODO(LucasAVasco): Remove the comments after the `startEventSeen` function be ported
+
+	return {
+		stop: true,
+		remove: removeContainer,
+	};
 }
 
 export function getRemoteWorkspaceFolder(config: DevContainerFromDockerComposeConfig) {

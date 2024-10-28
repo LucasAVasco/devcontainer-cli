@@ -11,7 +11,7 @@ import { mapNodeOSToGOOS, mapNodeArchitectureToGOARCH } from '../spec-configurat
 import { DockerResolverParameters, DevContainerAuthority, UpdateRemoteUserUIDDefault, BindMountConsistency, getCacheFolder, GPUAvailability } from './utils';
 import { createNullLifecycleHook, finishBackgroundTasks, ResolverParameters, UserEnvProbe } from '../spec-common/injectHeadless';
 import { GoARCH, GoOS, getCLIHost, loadNativeModule } from '../spec-common/commonUtils';
-import { resolve } from './configContainer';
+import { end, resolve } from './configContainer';
 import { URI } from 'vscode-uri';
 import { LogLevel, LogDimensions, toErrorText, createCombinedLog, createTerminalLog, Log, makeLog, LogFormat, createJSONLog, createPlainLog, LogHandler, replaceAllLog } from '../spec-utils/log';
 import { dockerComposeCLIConfig } from './dockerCompose';
@@ -73,6 +73,10 @@ export interface ProvisionOptions {
 	omitSyntaxDirective?: boolean;
 	includeConfig?: boolean;
 	includeMergedConfig?: boolean;
+}
+
+export interface CloseOptions extends ProvisionOptions {
+	down: boolean,
 }
 
 export async function launch(options: ProvisionOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
@@ -234,6 +238,29 @@ export async function createDockerParams(options: ProvisionOptions, disposables:
 		buildxOutput: common.buildxOutput,
 		buildxCacheTo: common.buildxCacheTo,
 		platformInfo
+	};
+}
+
+// NOTE(Lucasavasco): I did not name the function below as 'stop' to avoid confusions with the CLI command 'stop'
+export async function close(options: CloseOptions, providedIdLabels: string[] | undefined, disposables: (() => Promise<unknown> | undefined)[]) {
+	const params = await createDockerParams(options, disposables);
+	const output = params.common.output;
+	const text = 'Closing Remote';
+	const start = output.start(text);
+
+	const result = await end(params, options.configFile, options.overrideConfigFile, providedIdLabels, options.additionalFeatures ?? {}, options.down);
+	output.stop(text, start);
+	const { dockerContainerId, composeProjectName } = result;
+	return {
+		containerId: dockerContainerId,
+		composeProjectName,
+		finishBackgroundTasks: async () => {
+			try {
+				await finishBackgroundTasks(result.params.backgroundTasks);
+			} catch (err) {
+				output.write(toErrorText(String(err && (err.stack || err.message) || err)));
+			}
+		},
 	};
 }
 
